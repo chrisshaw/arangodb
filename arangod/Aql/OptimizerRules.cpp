@@ -4436,127 +4436,173 @@ void arangodb::aql::inlineSubqueriesRule(Optimizer* opt,
   opt->addPlan(std::move(plan), rule, modified);
 }
 
-
-
-/// @brief gets the (only) parent
-ExecutionNode* getOnlyParent(ExecutionNode* node){
-  if(!node){ return nullptr; }
-  auto parents = node->getParents();
-  if(parents.size() != 1) {
-    //LOG_DEVEL << "more than one parent";
+ExecutionNode* findInDependencies(ExecutionNode * const startNode
+                                 ,ExecutionNode::NodeType typeToFind
+                                 ){
+  if(!startNode){
     return nullptr;
   }
-  auto rv = parents[0];
-  TRI_ASSERT(rv != node);
-  if(rv == node) {
-    // this should probably never happen
-    // could this be asserted
-    //LOG_DEVEL << "node is it's own parent";
-    return nullptr;
-  }
-  return rv;
-}
-
-
-/// @brief looks for nodetype in parents walking over allowed node types
-ExecutionNode* findInParents(ExecutionNode * const startNode
-                            ,ExecutionNode::NodeType typeToFind
-                            ,std::vector<ExecutionNode::NodeType> const& allowedTypes
-                            ,bool readOnlySubQueries = true
-                            ){
-
-  ExecutionNode* currentNode = getOnlyParent(startNode); //move down from start node
+  ExecutionNode* currentNode = startNode->getFirstDependency();
 
   while(currentNode){
     auto currentType = currentNode->getType();
 
     if(currentType == typeToFind){
-      return currentNode; // current node matches the search
+      return currentNode;
     }
-
-    auto found = std::find(allowedTypes.begin(), allowedTypes.end(), currentType);
-    if(found != allowedTypes.end()){
-      if (readOnlySubQueries &&
-          currentType == ExecutionNode::SUBQUERY &&
-          static_cast<SubqueryNode*>(currentNode)->isModificationQuery()
-         ) { return nullptr; }
-      currentNode = getOnlyParent(currentNode); //advance
-    } else {
-      //LOG_DEVEL_IF( currentType != 18 ) << currentType << " is not allowed!";
-      return nullptr; // type not allowed
-    }
+    currentNode = currentNode->getFirstDependency();
   }
-  // no valid current node - terminate unsuccessful search
   return nullptr;
 }
 
-/// @brief moves a limit from the coordinator to the DBServer if feasible
+std::tuple<ExecutionNode*,ExecutionNode::NodeType>
+findInDependencies(ExecutionNode * const startNode
+                  ,std::vector<ExecutionNode::NodeType> const& typesToFind
+                  ,std::vector<ExecutionNode::NodeType> const& allowedTypes
+                  ,bool readOnlySubQueries = true
+                  ){
+
+  std::tuple<ExecutionNode*,ExecutionNode::NodeType> rv{nullptr,ExecutionNode::SINGLETON};
+
+  if(!startNode){
+    return rv;
+  }
+  ExecutionNode* currentNode = startNode->getFirstDependency();
+
+  while(currentNode){
+    auto currentType = currentNode->getType();
+
+    auto found = std::find(typesToFind.begin(), typesToFind.end(), currentType);
+    if(found != typesToFind.end()){
+      std::get<0>(rv) = currentNode;
+      std::get<1>(rv) = *found;
+      return rv;
+    }
+
+    if (allowedTypes.size()) {
+      auto found = std::find(allowedTypes.begin(), allowedTypes.end(), currentType);
+      if(found != allowedTypes.end()){
+        if (readOnlySubQueries &&
+            currentType == ExecutionNode::SUBQUERY &&
+            static_cast<SubqueryNode*>(currentNode)->isModificationQuery()
+           ) { return rv; }
+        currentNode = currentNode->getFirstDependency();
+      } else {
+        return rv;
+      }
+    }
+
+  }
+  return rv;
+}
+
+ExecutionNode* insertAbove(ExecutionNode* referenceNode, ExecutionNode* nodeToInsert){
+  ExecutionNode* referenceDependency = referenceNode->getFirstDependency();
+  if(!referenceDependency){
+    LOG_DEVEL << "remote has no dependency";
+    return nullptr;
+  }
+
+  nodeToInsert->addDependency(referenceDependency);
+  referenceNode->replaceDependency(referenceDependency,nodeToInsert);
+  return nodeToInsert;
+}
+
+/// @brief moves limits up towards the singleton nodes
+/// TODO - add documentation when done
 void arangodb::aql::optimizeClusterLimitsToShardsRule(Optimizer* opt,
                                              std::unique_ptr<ExecutionPlan> plan,
                                              OptimizerRule const* rule) {
 
-  // TODO - Remove logging comments (LOG_DEVEL) in this and called functions
-  //        when the rules is finished - All allowed nodes types added to
-  //        findInParents call
-
   TRI_ASSERT(arangodb::ServerState::instance()->isCoordinator());
+
+  static const std::vector<ExecutionNode::NodeType>
+    allowedTypes = {
+      ExecutionNode::SCATTER,
+      ExecutionNode::GATHER,
+      ExecutionNode::DISTRIBUTE,
+      ExecutionNode::CALCULATION,
+      ExecutionNode::SUBQUERY,
+      ExecutionNode::ENUMERATE_LIST,
+      ExecutionNode::ENUMERATE_COLLECTION,
+      ExecutionNode::INDEX
+    };
+
+  static const std::vector<ExecutionNode::NodeType>
+    remoteOrLimit = {
+      ExecutionNode::REMOTE,
+      ExecutionNode::LIMIT
+    };
+
   bool wasModified = false;
 
   SmallVector<ExecutionNode*>::allocator_type::arena_type s;
-  SmallVector<ExecutionNode*> nodes{s};
-  plan->findNodesOfType(nodes, ExecutionNode::GATHER, true);
+  SmallVector<ExecutionNode*> endNodes{s};
+  plan->findEndNodes(endNodes,true);
 
-  for (auto const& n : nodes) {
+  for (auto* current : endNodes) {
+    LimitNode* foundLimitNode = nullptr;
 
-    // numbered steps
-    //
-    // remoteNodeDep         (4) check that this node exists
-    // -- limitNode --       (5) insert new limit node - limit = oldLimit + oldOffset, offset = 0
-    // remoteNode            (3) check if this is a remote node
-    // gatherNode            (0) start here
-    // -- allowed nodes --   (1) skip nodes with allowed types
-    // limit                 (2) check if node is of type limit limit and has not _fullCount set to true
-    //
-    //(6) update dependencies so the new limitNode is connected to remoteNodeDep and remoteNode
+    while (current) {
 
-    // (1-2)
-    // forbidden:            sort, collect, filter, subquery (writeable)
-    // no sense:             return gather remote
-    // possilble candidates: subquery (readonly), insert, remove, replace, update, noresults, distriubte, upsert, traversal, index, shortest_path
+      if(!foundLimitNode){
+        LimitNode* limitNode = static_cast<LimitNode*>(findInDependencies(current, ExecutionNode::LIMIT));
+        current = limitNode; // advance current
+        if (!limitNode) {
+          continue;
+        }
+        if(limitNode->getFullCount()){
+          LOG_DEVEL << "fullcount node";
+          continue;
+        }
+        foundLimitNode = limitNode;
+        LOG_DEVEL << "found limit node";
+      }
 
-    static const std::vector<ExecutionNode::NodeType> allowedTypes = { ExecutionNode::SCATTER , ExecutionNode::CALCULATION };
-    ExecutionNode* limitNode = findInParents(n, ExecutionNode::LIMIT, allowedTypes);
-    if (!limitNode) {
-      continue;
-    }
+      auto findResultTuple = findInDependencies(current, remoteOrLimit, allowedTypes);
+      ExecutionNode* node = std::get<0>(findResultTuple);
+      if(!node){
+        LOG_DEVEL <<"break inner branch";
+        foundLimitNode = nullptr; // indirect advance
+      } else {
 
-    // (2)
-    LimitNode* original = static_cast<LimitNode*>(limitNode);
-    if(original->getFullCount()){
-      continue;
-    }
+        LOG_DEVEL << "entering second part";
+        current = node; // advance
+        if (ExecutionNode::LIMIT == std::get<1>(findResultTuple)) {
+          LOG_DEVEL << "found followup limit";
+          LimitNode* newLimitNode = static_cast<LimitNode*>(node);
 
-    // (3)
-    auto remoteNode = n->getFirstDependency();
-    if (!remoteNode || remoteNode->getType() != ExecutionNode::REMOTE || n->getDependencies().size() != 1) {
-      continue;
-    }
+          if (newLimitNode->getFullCount()){
+            LOG_DEVEL << "fullcount node";
+            foundLimitNode = nullptr;
+            continue;
+          }
 
-    // (4)
-    auto remoteNodeDep = remoteNode->getFirstDependency();
-    if(!remoteNodeDep || remoteNode->getDependencies().size() != 1){
-      continue;
-    }
+          // merge limits
+          if(  foundLimitNode->offset() == newLimitNode->offset()
+            && foundLimitNode->limit()  <  newLimitNode->limit()){
+            LOG_DEVEL << "merge nodes";
+            //  newLimitNode->setLimit();
+          }
 
-    // (5) create copy of limit node
-    LimitNode* clone = new LimitNode(plan.get(), plan->nextId(), 0 /*offset*/, original->offset() + original->limit() /*limit*/ );
-    wasModified = true;
-    plan->registerNode(clone);
+          wasModified = true;
+          foundLimitNode = newLimitNode;
 
-    // (6) update dependencies
-    clone->addDependency(remoteNodeDep);
-    remoteNode->replaceDependency(remoteNodeDep,clone);
-  }
+        } else if (ExecutionNode::REMOTE == std::get<1>(findResultTuple)) {
+          LOG_DEVEL << "found remote";
+          LimitNode* insertLimitNode = new LimitNode(plan.get(), plan->nextId(),
+                                                     0 /*offset*/,
+                                                     foundLimitNode->offset() + foundLimitNode->limit() /*limit*/ );
+          wasModified = true;
+          LOG_DEVEL << "register new node";
+          plan->registerNode(insertLimitNode);
+          LOG_DEVEL << "insert new limit";
+          current = insertAbove(current, insertLimitNode); // advance
+          LOG_DEVEL << "inserted new limit";
+        }
+      } // if node
+    } // current - branch between endnode and singleton node
+  } // endnodes
 
   opt->addPlan(std::move(plan), rule, wasModified);
 }
