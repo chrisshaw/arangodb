@@ -36,8 +36,8 @@ The meaning of the statistics attributes is as follows:
   without an index. Documents scanned by subqueries will be included in the result, but not
   no operations triggered by built-in or user-defined AQL functions.
 * *scannedIndex*: the total number of documents iterated over when scanning a collection using
-  an index. Documents scanned by subqueries will be included in the result, but not
-  no operations triggered by built-in or user-defined AQL functions.
+  an index. The result will inlude documents scanned by subqueries but not
+  documents scanned by operations triggered by built-in or user-defined AQL functions.
 * *filtered*: the total number of documents that were removed after executing a filter condition
   in a `FilterNode`. Note that `IndexRangeNode`s can also filter documents by selecting only
   the required index range from a collection, and the `filtered` value only indicates how much
